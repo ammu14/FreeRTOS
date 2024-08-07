@@ -1,0 +1,619 @@
+# ``FreeRtos``随记（重要：任务调度、休眠唤醒、内存管理）
+
+前言：这是一篇`FreeRTOS`随记，想到什么写什么，随时补充，不定期修正，因此只能当作学习后的补充。采用的硬件开发板为江科大stm32套件。
+
+## 记录
+
+| **进度一** | 完成任务增、队列、信号/互斥量、事件组、任务通知、软件定时器部分的学习和使用 | 7/31前 |
+| ------ | ------------------------------------------------------------ | ------ |
+| **进度二** | **任务调度相关源码阅读** |        |
+|  |                                                              |        |
+|        |                                                              |        |
+
+
+
+## 基础部分
+
+### 1、关于几个Delay函数的使用
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240630110152109.png" alt="image-20240630110152109" style="zoom:50%;" />
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240630110201817.png" alt="image-20240630110201817" style="zoom:50%;" />
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240701142214449.png" alt="image-20240701142214449" style="zoom:50%;" />
+
+``osDelay(1)``允许当前任务暂停，从而让调度器可以切换到其他任务，如果没有这个延迟，会陷在死循环里，其他任务无法执行——“任务饿死”。
+
+简而言之，``HAL_Delay``就是“无用功”。
+
+因此需要实现例如LED闪烁这类操作的时候，最好还是采用定时器。
+
+``vTaskDelayUntil``的函数原型：
+
+```c
+BaseType_t xTaskDelayUntil( TickType_t * const pxPreviousWakeTime, const TickType_t xTimeIncrement );
+```
+
+他的阻塞时间为``pxPreviousWakeTime+xTimeIncrement``，单位都是``Tick Count``，是一个绝对的延时。
+
+### 2、``FreeRtos``的任务创建、删除、挂机等
+
+任务`task`即线程`thread`。但在`FreeRtos`中，它有些不一样，所以叫做任务可能更加合适。
+
+为了统一`FreeRtos`和``RT-thread``等系统，`cubemx`会用`osThreadNew`将两者的创建任务的函数再进行一次封装。
+
+所以使用`cubemx`建立的工程实际上是`CMSIS-RTOS`，与`FreeRTOS`稍微有些区别。
+
+并且他们在配置上可能会出现不匹配的情况
+
+* **堆栈大小**：`CMSIS-RTOS`的默认堆栈大小可能与 `FreeRTOS` 不同。确保 `osThreadNew` 使用的堆栈大小足够。
+
+  在这里我们会遇到一个问题：如何确定一个任务到底需要多大的栈空间呢？一般来说，计算是最直接的方式，但通常不会这么做。大部分用户会简单地先赋予一个自认为“合理”的值，然后通过其他方式来进行调整。比如说查询任务到底用了多少栈空间，关于这一点请等笔者学习了后面的内容再做解答。
+
+* **优先级**：`CMSIS-RTOS `的优先级范围和 `FreeRTOS` 不同，所以在配置的时候会有一定的差异。但当我们对 `FreeRTOS` 赋予一个超过上限的值，则会导致实际分配的优先级为所允许的最大值。
+
+* **线程属性**：`osThreadNew` 使用 `osThreadAttr_t` 结构体来配置线程属性，如果这些属性设置不当，会导致任务创建失败。
+
+`FreeRtos`:`xTaskCreateStatic/xTaskCreate`
+
+`FreeRTOS`中的每一个已创建任务都包含一个任务控制块/句柄，任务控制块是一个结构体变量；`osThreadNew()`则会直接返回该任务的句柄，因此可以创建一个全局变量来`handle`用以获取句柄。
+`FreeRTOS`用任务控制块结构体存储任务的属性。
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240702132318217.png" alt="image-20240702132318217" style="zoom:50%;" />
+
+`RT-thread`：`rt_thread_create`
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240701141335291.png" alt="image-20240701141335291" style="zoom: 80%;" />
+
+当调用挂起函数挂起自身时，后续的操作都不会执行，也就是②是不会执行到的，所以会看到现象LED常亮。若将flag=0的语句放到挂起后面，也同样不会被执行，因此要注意逻辑。
+
+![image-20240701141601860](C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240701141601860.png)
+
+重新恢复任务需要在别的地方，比如中断/别的任务。
+
+### 3、内存管理（这是一块比较重要的内容，我会尽可能详细的做些笔记）
+
+内存不能计算，所有计算都在CPU，指令保存在Flash。
+
+CPU里包含了运算器和寄存器。
+
+假设有如下任务：a = a + b，a和b都是具体数值，保存在内存中。
+
+Flash中命令如下：
+
+```assembly
+LDR R0, [a]
+LDR R1, [b]
+ADD R0, R0, R1
+STR R0, [a]
+```
+
+上述代码的一般过程：CPU从Flash中获取到命令，并执行。首先从内存中读取a，保存到R0，然后读取b，保存到R1，执行R0+R1，并保存到R0，最后将寄存器R0的值保存到a。
+
+接下来就正式到了`FreeRTOS`的内存管理部分。
+
+`FreeRTOS`提供5种动态内存管理的算法。
+
+* heap_1：只允许申请，不允许释放；
+* heap_2：允许申请和释放，不允许合并相邻的空闲内存；
+* heap_3：封装了C库的malloc和free；
+* heap_4：允许申请和释放，允许合并相邻的空闲内存；
+* heap_5：能够管理多个非连续内存区域的heap_4。
+
+使用`cubemx`的时候，我们可以选择我们要用哪一套内存管理算法，默认是heap_4，故在此处我们不对其他几套算法做理解。
+
+```c
+/* Allocate the memory for the heap. */
+#if( configAPPLICATION_ALLOCATED_HEAP == 1 )
+	/* The application writer has already defined the array used for the RTOS
+	heap - probably so it can be placed in a special segment or address. */
+	extern uint8_t ucHeap[ configTOTAL_HEAP_SIZE ];
+#else
+	static uint8_t ucHeap[ configTOTAL_HEAP_SIZE ];
+#endif /* configAPPLICATION_ALLOCATED_HEAP */
+```
+
+`xPortGetFreeHeapSize()`可以获取内存堆中为被分配的内存总量，从而根据自己的需求修改`configTOTAL_HEAP_SIZE`进行优化配置。
+
+```c
+/* Define the linked list structure.  This is used to link free blocks in order
+of their memory address. */
+typedef struct A_BLOCK_LINK
+{
+	struct A_BLOCK_LINK *pxNextFreeBlock;	/*<< The next free block in the list. */
+	size_t xBlockSize;						/*<< The size of the free block. */
+} BlockLink_t;
+```
+
+对于32位单片机而言，`xBlockSize`是一个无符号32位，最高位用来表示内存块是否被占用，如果被占用则为1。因此从0-30位表示内存块的大小。0x80000000。
+
+`pxNextFreeBlock`则将其他的未分配的内存块连城链表，且不按照大小排列，而是按照地址从小到大排序，这是为了方便以后插入新的内存块。
+
+为了方便管理这个空闲块链表，在 heap_4.c 文件中还定义了一个内存块和一个内存块指针来作为空闲块链表的链表头和指向空闲块链表链表尾，这两个定义如下：
+
+```c
+static BlockLink_t xStart, *pxEnd = NULL;
+```
+
+其中，`xStart`作为空闲块链表的链表头，`pxEnd`指向空闲块链表的链表尾，需要注意的是，`xStart` 不是内存堆中的内存块，而`pxEnd`所指向的内存块则占用了内存堆中一个内存块结构体，只是`pxEnd` 指向的链表尾内存块的内存大小为 0，因此 `xStart` 内存块和 `pxEnd`指向的内存块并不包含可分配的内存。
+
+接下来重点分析初始化内存堆的函数：
+
+```C
+static void prvHeapInit( void )
+{
+    BlockLink_t * pxFirstFreeBlock;
+    uint8_t * pucAlignedHeap;
+    size_t uxAddress;
+    /* 获取内存堆的大小，
+    * 即配置项 configTOTAL_HEAP_SIZE 的值
+    */
+    size_t xTotalHeapSize = configTOTAL_HEAP_SIZE;
+    /* 获取内存堆的起始地址 */
+    uxAddress = ( size_t ) ucHeap;
+    /* 将内存堆的起始地址按 portBYTE_ALIGNMENT 字节向上对齐
+    * 并且重新计算地址对齐后内存堆的大小
+    */
+    if( ( uxAddress & portBYTE_ALIGNMENT_MASK ) != 0 )
+    {
+        uxAddress += ( portBYTE_ALIGNMENT - 1 );
+        uxAddress &= ~( ( size_t ) portBYTE_ALIGNMENT_MASK );
+        xTotalHeapSize -= uxAddress - ( size_t ) ucHeap;
+    }
+    /* 获取对齐后的地址 */
+    pucAlignedHeap = ( uint8_t * ) uxAddress;
+    /* xStart 内存块的下一个内存块指向内存堆 */
+    xStart.pxNextFreeBlock = ( void * ) pucAlignedHeap;
+    /* xStart 内存块的大小固定为 0 */
+    xStart.xBlockSize = ( size_t ) 0;
+    /* 从内存堆的末尾与空出一个内存块结构体的内存
+    * 并让 pxEnd 指向这个内存块
+    */
+    /* 获取内存堆的结束地址 */
+    uxAddress = ( ( size_t ) pucAlignedHeap ) + xTotalHeapSize;
+    /* 为 pxEnd 预留内存空间 */
+    uxAddress -= xHeapStructSize;
+    /* 地址按 portBYTE_ALIGNMENT 字节向下对齐 */
+    uxAddress &= ~( ( size_t ) portBYTE_ALIGNMENT_MASK );
+    /* 设置 pxEnd */
+    pxEnd = ( void * ) uxAddress;
+    /* pxEnd 内存块的大小固定为 0 */
+    pxEnd->xBlockSize = 0;
+    /* pxEnd 指向的内存块没有下一个内存块 */
+    pxEnd->pxNextFreeBlock = NULL;
+    /* 将内存堆作为一个空闲内存块 */
+    pxFirstFreeBlock = ( void * ) pucAlignedHeap;
+    /* 设置空闲内存块的大小
+    * 空闲内存块的大小为 pxEnd 指向的地址减内存块结构体的大小
+    */
+    pxFirstFreeBlock->xBlockSize = uxAddress - ( size_t ) pxFirstFreeBlock;
+    /* 空闲内存块的下一个内存块指向 pxEnd */
+    pxFirstFreeBlock->pxNextFreeBlock = pxEnd;
+    /* 此时内存堆中只有一个空闲内存块，
+    * 并且这个内存块覆盖了整个内存堆空间
+    */
+    xMinimumEverFreeBytesRemaining = pxFirstFreeBlock->xBlockSize;
+    xFreeBytesRemaining = pxFirstFreeBlock->xBlockSize;
+    /* 此变量限制了内存块的大小，
+    * 在 32 位系统中，这个值的计算结果为 0x80000000，
+    * 内存块结构体中的成员变量 xBlockSize 的最高位
+    * 用来标记内存块是否被分配，
+    * 其余位用来表示内存块的大小，
+    * 因此内存块的大小最大为 0x7FFFFFFF，
+    * 即内存块的大小小于 xBlockAllocatedBit 的值
+    */
+    xBlockAllocatedBit = ((size_t)1) << ((sizeof(size_t)*heapBITS_PER_BYTE)-1);
+}
+```
+
+![image-20240709192729518](C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240709192729518.png)
+
+从上图中可以看出，heap_4 内存管理算法初始化后的内存堆被分成了两个内存块，分别被
+内存块指针 `pxFirstFreeBlock` 和内存块指针 `pxEnd`所指向，其中内存块指针 `pxEnd` 所指向的内
+存块就是空闲块链表的链表尾，虽然这个链表尾内存块占用了内存堆中的内存，但是并不能作
+为空闲内存被分配，而被内存块指针 `pxFirstFreeBlock` 所指向的内存块才是可以被分配的空闲
+内存块。
+
+```C
+static void prvInsertBlockIntoFreeList( BlockLink_t * pxBlockToInsert )
+{
+    BlockLink_t * pxIterator;
+    uint8_t * puc;
+    /* 从头开始遍历空闲块链表，
+    * 找到第一个下一个内存块的起始地址比待插入内存块高的内存块
+    */
+    for( pxIterator = &xStart; pxIterator->pxNextFreeBlock < pxBlockToInsert;
+        pxIterator = pxIterator->pxNextFreeBlock )
+    {
+        /* 什么都不做 */
+    }
+    /* 获取找到的内存块的起始地址 */
+    puc = ( uint8_t * ) pxIterator;
+    /* 判断找到的这个内存块是否与待插入内存块的低地址相邻 */
+    if( ( puc + pxIterator->xBlockSize ) == ( uint8_t * ) pxBlockToInsert )
+    {
+        /* 将两个相邻的内存块合并 */
+        pxIterator->xBlockSize += pxBlockToInsert->xBlockSize;
+        pxBlockToInsert = pxIterator;			//指向同一个地址
+    }
+    else
+    {
+        mtCOVERAGE_TEST_MARKER();
+    }
+    /* 获取待插入内存块的起始地址 */
+    puc = ( uint8_t * ) pxBlockToInsert;
+    /* 检查两个内存块是否相邻，目的是判断是否可以将这两个内存块合并成一个更大的块 */
+    if( ( puc + pxBlockToInsert->xBlockSize ) == 
+       ( uint8_t * ) pxIterator->pxNextFreeBlock )
+    {
+        /* 要合并的内存块不能为 pxEnd */
+        if( pxIterator->pxNextFreeBlock != pxEnd )
+        {
+            /* 将两个内存块合并 */
+            pxBlockToInsert->xBlockSize += pxIterator->pxNextFreeBlock->xBlockSize;
+            pxBlockToInsert->pxNextFreeBlock = pxIterator->pxNextFreeBlock->pxNextFreeBlock;
+        }
+        else
+        {
+            /* 将待插入内存块插入到 pxEnd 前面 */
+            pxBlockToInsert->pxNextFreeBlock = pxEnd;
+        }
+    }
+    else
+    {
+        /* 将待插入内存块插入到找到的内存块的下一个内存块前面 */
+        pxBlockToInsert->pxNextFreeBlock = ->pxNextFreeBlock;
+    }
+    /* 判断找到的内存块是否不因为与待插入内存块的低地址相邻，
+    * 而与待插入内存块合并
+    */
+    if( pxIterator != pxBlockToInsert )
+    {
+        /* 将找到的内存块的下一个内存块指向待插入内存块 */
+        pxIterator->pxNextFreeBlock = pxBlockToInsert;
+    }
+    else
+    {
+        /* 如果已经合并了，
+        * 那么找到的内存块指向下一个内存块的指针已经被设置了，
+        * 不应该再被设这，否为会指向它本身
+        */
+        mtCOVERAGE_TEST_MARKER();
+    }
+}
+```
+
+
+
+### 4、任务调度
+
+非运行状态的任务，它处于这3中状态之一：阻塞(Blocked)、暂停(Suspended)、就绪(Ready)。就绪态的任务，可以被调度器挑选出来切换为运行状态，调度器永远都是挑选最高优先级的就绪态任务并让它进入运行状态。
+
+`FreeRtos`中主要采用抢占式和时间片两种方式：
+
+抢占式：针对不同优先级的任务，优先级高的任务可以抢占优先级低的任务，当优先级高的任务被挂起或阻塞时，才能运行低优先级的任务。
+
+阻塞状态的任务，它在等待"事件"，当事件发生时任务就会进入就绪状态。
+
+事件分为两类：时间相关的事件、同步事件。
+
+所谓时间相关的事件，就是设置超时时间：在指定时间内阻塞，时间到了就进入就绪状态。使用时间相关的事件，可以实现周期性的功能、可以实现超时功能。
+
+同步事件就是：某个任务在等待某些信息，别的任务或者中断服务程序会给它发送信息。怎么"发送信息"？
+
+* `任务通知(task notification)`
+* `队列(queue)`
+* `事件组(event group)`
+* `信号量(semaphoe)`
+* `互斥量(mutex)`
+
+这些方法用来发送同步信息，比如表示某个外设得到了数据。
+
+时间片：针对优先级相同的任务，任务调度器会在每一次系统时钟节拍到的时候切换任务，也就是说 CPU 轮流运行优先级相同的任务，每个任务运行的时间就是一个系统时钟节拍。
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240701164650984.png" alt="image-20240701164650984" style="zoom: 67%;" />
+
+### 5、优先级问题
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240701105527078.png" alt="image-20240701105527078" style="zoom:67%;" />
+
+虽然文档中列出了40个优先级的定义，但`FreeRTOS`实际支持的优先级级别仍然是32个。
+
+这可能是为了在不同的系统或者特定应用场景下提供更多的灵活性和选择。
+
+### 6、同步与互斥的问题
+
+同步与互斥对于初学者来说是个记忆弄混淆的概念。韦东山`FreeRTOS`的文档中给出的两个例子很生动，但不够明显，如果没有提前学过，根本抓不住重点。
+
+* 同步：协调多个线程的操作，避免出现竞争。比如飞机上的卫生间一次只能有一个人进去，其他人要进去就得按顺序来，这个过程就叫做同步。
+* 互斥：在任何时候，只允许一个线程访问共享资源。比如飞机上的厕所，不能同时一群人使用，产生了冲突，这就叫互斥。
+
+由此可见，同步与互斥的关系相当密切，很容易混淆。
+
+但他有啥用？目前我也一知半解，继续学习下去我想会得到我要的答案。
+
+### 7、队列
+
+`FreeRTOS`的队列相对简单，它已经帮你造好了“轮子”，使用者只需要简单的CRUD，但我们仍然需要去了解队列的实现过程，这就要靠自己学习了。
+
+关于队列的删除：
+
+```C
+void KeyTask(void *argument)
+{
+	static uint8_t key_value = 0;
+	while(1)
+	{
+		osDelay(1);
+		key_value = Key_GetNum();
+		switch(key_value)
+		{
+			case 1:
+				HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_0);
+				if(xQueue1 != NULL)					//判断是否被删除
+				{
+					vQueueDelete(xQueue1);			//未被删除要删除
+					xQueue1 = NULL;				    //手动讲句柄赋值为NULL
+					xQueue1_flag = 0;
+				}
+				else
+				{
+					xQueue1 = xQueueCreate(Queue_Length, sizeof(uint16_t));
+					if(xQueue1 == NULL)
+					{
+						xQueue1_flag = 1;         	//创建失败
+					}
+					else
+					{
+						xQueue1_flag = 2;		   //创建成功
+					}
+				}
+				key_value = 0;
+				break;
+			case 2:
+				HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_0);
+				
+				if(xQueue2 != NULL)
+				{
+					vQueueDelete(xQueue2);
+					xQueue2 = NULL;
+					xQueue2_flag = 0;
+				}
+				else
+				{
+					xQueue2 = xQueueCreate(Queue_Length, sizeof(uint16_t));
+					if(xQueue2 == NULL)
+					{
+						xQueue2_flag = 1;        			 //创建失败
+					}
+					else
+					{
+						xQueue2_flag = 2;					//创建成功
+					}
+				}
+				key_value = 0;
+				break;
+		}
+	}
+}
+```
+
+以上为一段创建&删除队列的程序，通过2个按键实现创建和删除任务，同时用LED亮灭还表示按键是否奏效。
+
+当删除任务后，必须手动赋值队列的句柄为NULL，否则会出现多次free的情况，造成内存泄漏或者其他BUG，比如编译不通过（在不同编译器和平台可能会有不同的表现），因此在进行`vQueueDelete`前，需要对句柄进行一次判断，是否为NULL；`vQueueDelete`之后要进行一次手动赋值句柄为NULL。
+
+当我在创建成功后就对队列进行“入队”、“查询”、“删除”。
+
+```c
+//当我定义一条数据
+char string[10] = "absms";
+/********发送消息的条件省略********/
+//执行入队操作，并查询
+xQueueSendToBack(xQueue1, string, pdMS_TO_TICKS(10);	
+remain_message = uxQueueMessagesWaiting(xQueue1);
+remain_space = uxQueueSpacesAvailable(xQueue1);
+/********接收消息的条件省略********/
+//执行出队操作，并查询   
+xQueueReceive(xQueue1, rx_buffer, pdMS_TO_TICKS(10);
+remain_message = uxQueueMessagesWaiting(xQueue1);
+remain_space = uxQueueSpacesAvailable(xQueue1);        
+```
+
+预先创建的队列为长度为10，在发送一条消息后，
+
+remain_message = 1；
+
+remain_space = 9；
+
+这说明消息占据的空间与string的长度无关，事实上，xQueueSendToBack函数传进去的只不过是string的地址。
+
+事实上我们通过阅读原本的发送函数：
+
+```C
+BaseType_t xQueueGenericSend( QueueHandle_t xQueue, const void * const pvItemToQueue, TickType_t xTicksToWait, const BaseType_t xCopyPosition )
+```
+
+第二个参数即是一个只想常量数据的常量指针。
+
+再回到我们最初创建这个队列：
+
+```c
+xQueueCreate(Queue_Length, sizeof(string))
+```
+
+我们给的两个参数，一个是长度，第二个参数是单个消息的大小。也就是说，我们创建了一个`Queue_Length`个`sizeof(string)`大小队列。
+
+这也就解释了`remain_message`和`remain_space`的变化。
+
+当我们出队后，`remain_message = 0`；`remain_space = 10`或者`A`。
+
+上述的代码只给出了关键步骤，具体执行的条件、成功失败判断需要具体问题具体分析。
+
+如果只需要查看数据要不进行出队操作，则调用Peek函数即可。
+
+邮箱`(Mailbox)`：在`FreeRTOS`中是一个很简单的概念
+
+* 它是一个长度为1的队列
+* 使用`xQueueOverwrite()` `xQueueOverwriteFromISR()`进行数据覆盖操作
+* 使用`xQueuePeek()`，`xQueuePeekFromISR()`进行“偷看”
+
+队列集：暂时认为很鸡肋的功能……所以大概了解了下，没有去做实验，亦或许是我学艺不精，尚未习得其要领。
+
+### 8、信号量/互斥量
+
+*信号量/互斥量就是资源分配。以0-1信号量为例，当信号量未被使用时，我们进行take，得到它，然后顺利执行接下来的部分程序，此时信号量剩下0个，则别的任务/程序就不能再执行。当我们将上面的程序执行完后再give，此时信号量又变成了1个，则别的程序/代码可以take，然后执行，执行完后give。*
+
+*于是我们可以想象得到它的应用场景：当我们执行suspend操作时，如果正在访问共享资源，则可能会引发某些问题。*
+
+*example：*
+
+```c
+switch(key_value)
+		{
+			case 1:
+				// 保护 OLED 清屏操作
+				if (xSemaphoreTake(xSemaphore, portMAX_DELAY) == pdTRUE)
+				{
+					OLED_Clear();
+					vTaskSuspend(ReadDataTask_handle);
+					HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_0);
+					xSemaphoreGive(xSemaphore);
+				}
+				break;
+			case 2:
+				if (xSemaphoreTake(xSemaphore, portMAX_DELAY) == pdTRUE)
+				{
+					OLED_Clear();
+					vTaskResume(ReadDataTask_handle);
+					HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_0);
+					xSemaphoreGive(xSemaphore);
+				}		
+				break;
+			default:	
+				break;
+		}
+
+```
+
+在上述代码中，如果我不使用互斥量进行资源保护，那么当我suspend的时候，可能会出现OLED的清屏出现问题，而进行保护后则不会有问题。
+
+在这里又不得不提`FreeRTOS`的2进制信号量和互斥量的问题了。
+
+* `FreeRTOS`的互斥量没有严格的所有权特性，因此可以由别的任务进行释放。
+* 但它仍然具有优先级继承权：当一个高优先级任务试图获取低优先级任务的互斥量时，低优先级任务将会暂时提升到与高优先级任务同样的优先级，以确保低优先级任务尽快完成工作，然后释放互斥量，之后它会恢复到原来的优先级。
+
+当然，这也只是一个非常简单的例子，我会继续随时补充。
+
+`FreeRTOS`提供的`vSemaphoreDelete()`删除没用提供返回值，因此我们无法直观的监控信号量是否被删除。
+
+多次使用`vSemaphoreDelete`会造成程序错误，这一点需要注意；
+
+另外，在`vSemaphoreDelete`之后，我们仍然可以对信号量进行give/take操作。
+
+这里要注意的是，我们每次使用完了信号量资源以后要记得释放，否则下一个资源就不能只用了。
+
+`FreeRTOS`的互斥很奇怪，它并没用从代码上实现：谁上锁就只能由谁开锁的逻辑。
+
+事实上，即使任务A已经上锁了，任务B也可以进行解锁，到头来还是需要工程师自己去把握。
+
+* PS：学习到这里，需要再次提醒，`CMSIS-RTOS`和`FreeRTOS`使用不同的API，但前者包括后者，可以使用`cubemx`图形化方式生成，请回到2`FreeRTOS`的任务部分。
+
+### 9、事件组
+
+单个事件的存储我们采用`BOOL`值，而`FreeRTOS`中我们采用`EventBits_t`类型的变量作为事件组的存储单元，它是一个16位/32位的变量，具体可以通过宏定义来设定。这并不意味着它将会用来存储32个事件。事实上，我们在使用32位无符号数据类型来存储事件时，其高8位会用来存储相应的控制信息，因此最多可以存储24个事件。
+
+### 10、任务通知
+
+间接通讯，通过队列、事件组、信号量/互斥量
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240707085217425.png" alt="image-20240707085217425" style="zoom:50%;" />
+
+任务通知采用直接通讯
+
+<img src="C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240707085248009.png" alt="image-20240707085248009" style="zoom:50%;" />
+
+优势：相比简介通讯的方式，采用直接通讯（任务通知）的方式可以节省大量的内存，因为每个通讯对象再使用前都需要被创建，而任务通知中的每个通知只需要在每个任务中占用固定的5字节内存。
+
+缺点：比较长，此处省略，具体请查看正点原子`FreeRTOS`手册。
+
+![image-20240707085827592](C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240707085827592.png)
+
+表 17.2.1 所列出的 API 函数都是对任务通知相关数组中下标为 0 的元素进行操作，而表17.2.2 中列出的 API 函数可以指定对任务通知相关数组中的元素进行操作。
+
+对于17.2.1，其实包含了两套任务：
+
+![image-20240707093730331](C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240707093730331.png)
+
+下面我们来深入解析下`ulTaskNotifyTake`接收任务的函数：
+
+| 参数                | 说明                                                         |
+| ------------------- | ------------------------------------------------------------ |
+| `xClearCountOnExit` | `函数返回前是否清零： pdTRUE：把通知值清零 pdFALSE：如果通知值大于0，则把通知值减一` |
+| `xTicksToWait`      | `任务进入阻塞态的超时时间，它在等待通知值大于0。 0：不等待，即刻返回； portMAX_DELAY：一直等待，直到通知值大于0； 其他值：Tick Count，可以用*pdMS_TO_TICKS()*把ms转换为Tick Count` |
+| `返回值`            | `函数返回之前，在清零或减一之前的通知值。 如果xTicksToWait非0，则返回值有2种情况： 1. 大于0：在超时前，通知值被增加了 2. 等于0：一直没有其他任务增加通知值，最后超时返回0` |
+
+举个例子，当give 5个通知时，调用`notify_val = ulTaskNotifyTake(pdFALSE, 0/其他值，除了portMAX_DELAY)`，则得到的结果会从5递减最后变成0；如果`xTicksToWait`给的是`portMAX_DELAY`，则不会递减到0，最后会停在1，因为需要等到通知值大于0。
+
+Ps：面对这样的设计，如果不经常的去使用/查看手册，光凭记忆很容易就会出现莫名其妙的BUG，查找起来也十分的不易，而这样的小错误往往是在开发中最常见的，所以作为一名工程师要习惯于多查手册。
+
+### 11、软件定时器
+
+![image-20240708145208399](C:\Users\scy32\AppData\Roaming\Typora\typora-user-images\image-20240708145208399.png)
+
+“软件定时器守护任务”`(Timer Daemon Task)`：是作为软件定时器的后台任务来管理和调度这些定时器的。每个软件定时器都有相应的回调函数，当定时器超时，就会被调用。
+
+守护任务：
+
+* 管理定时器列表：维护所有活动定时器的了，包括超时值和回调函数；
+* 检查定时器超市：定期检查定时器是否超时，若超时，将该定时器的回调函数加入到执行任务的队列中；
+* 调用回调函数：超时时调用回调函数。
+
+### 12、中断
+
+再次回顾一遍中断的处理流程
+
+1. 当系统在运行时，有因素触发了中断（比如按键外部中断），这时CPU就会跳转到固定的地址去执行代码，这个固定的地址我们称之为“中断向量”，这个跳转由硬件执行。
+2. 由于当前任务被打算，需要保存相应的寄存器等值
+3. 执行完以后再次回到原来的任务中继续执行未完成的任务。
+
+在执行中断ISR的时候，其他任务是无法执行的，因此这个过程要快。所以在ISR中，我们需要尽快的解决一些简单的任务，然后将重要的事情放到任务中去处理。
+
+中断的优先级永远是高于任务的，除非没有开启中断。
+
+根据文档，可知`FreeRTOS`中有两套API函数，因为普通的任务是阻塞式的，而ISR中不允许阻塞。
+
+### 13、关于临界区
+
+临界区中的代码必须是完整运行的，比如软件模拟的通信协议。`FreeRTOS`在进出临界区的时候通过关闭和打开管理的中断（不受管理的则不受到影响）从而保护临界区代码。
+
+临界区可以进行嵌套，即程序中可以重复进入临界区，但必须要进行相同次数的退出操作。
+
+### 14、低功耗和空闲任务
+
+当所有任务都处于阻塞/挂起的时候，只有空闲任务正在执行时，则会进入低功耗模式。
+
+接下来`FreeRTOS`会调用`prvGetExpectedIdleTime()`函数计算MCU需要进入低功耗的时长，只有当时长满足某个特定值(由宏定义`configEXPECTED_IDLE_TIME_BEFORE_SLEEP `给出)，才进入低功耗模式。接下来会进行第二次计算，这是因为第一次计算受到任务调度器的影响，并不准确；第二次计算的时长实在挂起任务调度器后完成的，最终会调用`prvGetExpectedIdleTime()`使得MCU确实的进入到低功耗模式。
+
+**空闲任务**，是在`FreeRTOS`执行`vTaskStartScheduler()`函数启动调度器时自动创建的一个任务，称之为空闲任务，这样可以确保系统中永远有一个任务正在被执行。空闲任务的优先级始终是最低的，以确保不影响其他任务，但这并不意味着不可以让它拥有其他的优先级，如果需要，你可以修改它。
+
+**空闲任务钩子函数**，该函数是一个回调函数，每循环一次空闲任务，该函数就会被调用一次。用途主要有以下几个：
+
+* 执行低优先级任务，后台或需要不停处理的功能代码
+* 测试系统处理裕量：因为空闲任务只会在所有任务都不运行的时候才会被调用，所以知道它占据的时间就是系统裕量。
+* 将处理器配置为低功耗：即没有任务执行时，进入低功耗/省电模式，这也是为什么我会将它二者放在一起的原因。
+
+空闲任务钩子函数的实现有几个限制/规则：
+
+* 绝不能阻塞或挂起！！！
+* 如果应用程序用到了 `vTaskDelete()`函数，则空闲钩子函数必须能够尽快返回。因为在任务被删除后，空闲任务负责回收内核资源。如果空闲任务一直运行在钩子函数中，则无法进行回收工作。
+* 空闲任务钩子函数必须具有函数名和函数原型：`void vApplicationIdleHook(void)`
+
+## 深入部分
+
+### 1、内部机制
+
+关于`CUBEMX`的`FreeRTOS`，我们首先必须了解`cmsis_os2.c`文件，`cmsis_os2.c` 文件将 `FreeRTOS` 的函数封装起来，以提供 `CMSIS-RTOS2 API `的实现。`CMSIS-RTOS2` 是 `ARM` 公司定义的一个标准接口，旨在为不同的 RTOS 提供统一的 API，使得开发者可以更轻松地在不同的 RTOS 之间移植代码。
+
+通过 `cmsis_os2.c`，开发者可以使用标准的 `CMSIS-RTOS2 API` 来操作 `FreeRTOS`，而不必直接使用 `FreeRTOS` 的原生 `API`。这种封装提供了一层抽象，使得应用代码更加便于移植到其他支持 `CMSIS-RTOS2` 的 `RTOS`。
+
+因此，如果你在学习中使用了`cubemx`，那么请一定要好好的学习新的接口，这会使你的代码看起来更加的规范。
